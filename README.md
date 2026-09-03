@@ -69,3 +69,15 @@ r1lite_sim_record/
 - **只观测，不发控制指令。**
 - 当前 episode 的 `action` 暂与关节 `state` 相同（尚无独立遥操动作话题）。
 - `ABORT` 只停本项目的仿真/预览/录制，不影响 Franka。
+
+## AHA-WAM 真机策略接口
+
+见 [`deploy/AHAWAM_REAL_ROBOT_INTERFACE.md`](deploy/AHAWAM_REAL_ROBOT_INTERFACE.md)。
+
+```bash
+# 125：仿真镜像真机动作 + 保存三路相机视频
+bash start_r1lite_infer_session.sh start
+
+# 机器人：推理桥（默认 dry-run；策略未起时加 --mock-policy）
+python3 scripts/ahawam_r1lite_policy_bridge.py --mock-policy --session-host 10.229.20.125
+```

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Start R1Lite triple-cam viewer + record daemon (independent of Franka).
+# Start R1Lite triple-cam viewer only (record daemon if needed).
+# For sim + record together, use: bash ../start_r1lite_sim_record.sh start
 set -eo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$ROOT/logs}"

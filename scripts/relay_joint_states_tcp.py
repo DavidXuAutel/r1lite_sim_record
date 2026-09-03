@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""On-robot relay: vendor /joint_states -> TCP + namespaced /r1lite/joint_states.
+"""On-robot relay: joints -> TCP + namespaced /r1lite/joint_states.
 
-Naming rules (do not collide with Franka on 10.229.20.125):
+Sources (merged):
+  1) /joint_states (vendor, if publishing)
+  2) /hdas/feedback_arm_{left,right} + /hdas/feedback_gripper_{left,right}
+
+Naming:
   ROS node : /r1lite/joint_tcp_relay
-  ROS topic: /r1lite/joint_states   (published)
+  ROS topic: /r1lite/joint_states
   TCP port : 8765
-
-Franka subscriptions are left untouched. This node only *reads* the vendor
-topic /joint_states on the robot and republishes under /r1lite/*.
 """
 
 from __future__ import annotations
@@ -28,51 +29,137 @@ R1LITE_NODE = "joint_tcp_relay"
 R1LITE_JOINT_TOPIC = "/r1lite/joint_states"
 VENDOR_JOINT_TOPIC = "/joint_states"
 
+LEFT_ARM = [f"left_arm_joint{i}" for i in range(1, 7)]
+RIGHT_ARM = [f"right_arm_joint{i}" for i in range(1, 7)]
+LEFT_FINGERS = ("left_gripper_finger_joint1", "left_gripper_finger_joint2")
+RIGHT_FINGERS = ("right_gripper_finger_joint1", "right_gripper_finger_joint2")
+# HDAS /hdas/feedback_gripper_* publishes a single scalar (~0 closed … ~100 open),
+# while /joint_states finger joints are meters in [0, 0.05] / [-0.05, 0].
+# Mixing raw HDAS into finger names caused TCP values to jump ~0 ↔ ~100.
+HDAS_GRIPPER_OPEN = 100.0
+FINGER_TRAVEL_M = 0.05
+VENDOR_SKIP_FINGERS = set(LEFT_FINGERS + RIGHT_FINGERS)
+
+
+def hdas_gripper_to_fingers(g: float) -> tuple[float, float]:
+    """Map HDAS gripper scalar to (finger1, finger2) prismatic meters."""
+    open_frac = max(0.0, min(1.0, float(g) / HDAS_GRIPPER_OPEN))
+    return open_frac * FINGER_TRAVEL_M, -open_frac * FINGER_TRAVEL_M
+
+
+FULL_ORDER = [
+    "steer_motor_joint1",
+    "wheel_motor_joint1",
+    "steer_motor_joint2",
+    "wheel_motor_joint2",
+    "steer_motor_joint3",
+    "wheel_motor_joint3",
+    "torso_joint1",
+    "torso_joint2",
+    "torso_joint3",
+    *LEFT_ARM,
+    "left_gripper_finger_joint1",
+    "left_gripper_finger_joint2",
+    *RIGHT_ARM,
+    "right_gripper_finger_joint1",
+    "right_gripper_finger_joint2",
+]
+
 
 class Relay(Node):
     def __init__(self, vendor_topic: str, publish_topic: str) -> None:
-        # Explicit namespaced node: /r1lite/joint_tcp_relay
         super().__init__(R1LITE_NODE, namespace=R1LITE_NS)
         self._lock = threading.Lock()
-        self.latest: dict | None = None
+        self._q: dict[str, float] = {n: 0.0 for n in FULL_ORDER}
+        self._have_data = False
         self._pub = self.create_publisher(JointState, publish_topic, 10)
-        qos = QoSProfile(
+        qos_tl = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=10,
         )
-        self.create_subscription(JointState, vendor_topic, self._cb, qos)
+        self.create_subscription(JointState, vendor_topic, self._on_vendor, qos_tl)
+        self.create_subscription(JointState, "/hdas/feedback_arm_left", self._on_left, qos_tl)
+        self.create_subscription(JointState, "/hdas/feedback_arm_right", self._on_right, qos_tl)
+        self.create_subscription(JointState, "/hdas/feedback_gripper_left", self._on_g_left, qos_tl)
+        self.create_subscription(JointState, "/hdas/feedback_gripper_right", self._on_g_right, qos_tl)
         self.get_logger().info(
-            f"node=/{R1LITE_NS}/{R1LITE_NODE}  sub={vendor_topic}  pub={publish_topic}"
+            f"node=/{R1LITE_NS}/{R1LITE_NODE} sub={vendor_topic}+hdas/feedback_* pub={publish_topic}"
         )
 
-    def _cb(self, msg: JointState) -> None:
-        # Republish under /r1lite/joint_states (never publish to bare /joint_states).
+    def _merge(self, mapping: dict[str, float]) -> None:
+        with self._lock:
+            self._q.update(mapping)
+            self._have_data = True
+            payload_names = list(FULL_ORDER)
+            payload_pos = [float(self._q.get(n, 0.0)) for n in payload_names]
         out = JointState()
-        out.header = msg.header
-        out.name = list(msg.name)
-        out.position = list(msg.position)
-        out.velocity = list(msg.velocity)
-        out.effort = list(msg.effort)
+        out.name = payload_names
+        out.position = payload_pos
         self._pub.publish(out)
 
-        payload = {
-            "name": list(msg.name),
-            "position": [float(x) for x in msg.position],
-            "stamp": {
-                "sec": int(msg.header.stamp.sec),
-                "nanosec": int(msg.header.stamp.nanosec),
-            },
+    def _on_vendor(self, msg: JointState) -> None:
+        # Prefer HDAS gripper conversion for fingers; jointTracker often reports 0.
+        m = {
+            str(n): float(p)
+            for n, p in zip(msg.name, msg.position)
+            if str(n) not in VENDOR_SKIP_FINGERS
         }
-        with self._lock:
-            self.latest = payload
+        self._merge(m)
+
+    def _on_left(self, msg: JointState) -> None:
+        m = {}
+        if len(msg.position) >= 6:
+            for i, n in enumerate(LEFT_ARM):
+                m[n] = float(msg.position[i])
+        for n, p in zip(msg.name, msg.position):
+            if str(n) not in VENDOR_SKIP_FINGERS:
+                m[str(n)] = float(p)
+        self._merge(m)
+
+    def _on_right(self, msg: JointState) -> None:
+        m = {}
+        if len(msg.position) >= 6:
+            for i, n in enumerate(RIGHT_ARM):
+                m[n] = float(msg.position[i])
+        for n, p in zip(msg.name, msg.position):
+            if str(n) not in VENDOR_SKIP_FINGERS:
+                m[str(n)] = float(p)
+        self._merge(m)
+
+    def _on_g_left(self, msg: JointState) -> None:
+        m = {}
+        if len(msg.position) >= 2:
+            # Already finger-like (meters); keep as-is.
+            m[LEFT_FINGERS[0]] = float(msg.position[0])
+            m[LEFT_FINGERS[1]] = float(msg.position[1])
+        elif len(msg.position) == 1:
+            f1, f2 = hdas_gripper_to_fingers(float(msg.position[0]))
+            m[LEFT_FINGERS[0]] = f1
+            m[LEFT_FINGERS[1]] = f2
+        self._merge(m)
+
+    def _on_g_right(self, msg: JointState) -> None:
+        m = {}
+        if len(msg.position) >= 2:
+            m[RIGHT_FINGERS[0]] = float(msg.position[0])
+            m[RIGHT_FINGERS[1]] = float(msg.position[1])
+        elif len(msg.position) == 1:
+            f1, f2 = hdas_gripper_to_fingers(float(msg.position[0]))
+            m[RIGHT_FINGERS[0]] = f1
+            m[RIGHT_FINGERS[1]] = f2
+        self._merge(m)
 
     def snapshot_line(self) -> str | None:
         with self._lock:
-            if self.latest is None:
+            if not self._have_data:
                 return None
-            return json.dumps(self.latest, separators=(",", ":")) + "\n"
+            payload = {
+                "name": list(FULL_ORDER),
+                "position": [float(self._q.get(n, 0.0)) for n in FULL_ORDER],
+            }
+            return json.dumps(payload, separators=(",", ":")) + "\n"
 
 
 def serve(relay: Relay, host: str, port: int, hz: float) -> None:
@@ -80,12 +167,8 @@ def serve(relay: Relay, host: str, port: int, hz: float) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
-    srv.listen(4)
-    print(
-        f"TCP joint relay listening on {host}:{port} @ {hz} Hz "
-        f"(ROS pub={R1LITE_JOINT_TOPIC})",
-        flush=True,
-    )
+    srv.listen(8)
+    print(f"TCP joint relay listening on {host}:{port} @ {hz} Hz", flush=True)
 
     def client_loop(conn: socket.socket, addr) -> None:
         print(f"client connected {addr}", flush=True)
@@ -106,16 +189,8 @@ def serve(relay: Relay, host: str, port: int, hz: float) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--vendor-topic",
-        default=VENDOR_JOINT_TOPIC,
-        help="Robot-side vendor topic to read (default /joint_states)",
-    )
-    parser.add_argument(
-        "--publish-topic",
-        default=R1LITE_JOINT_TOPIC,
-        help="Namespaced topic to publish (default /r1lite/joint_states)",
-    )
+    parser.add_argument("--vendor-topic", default=VENDOR_JOINT_TOPIC)
+    parser.add_argument("--publish-topic", default=R1LITE_JOINT_TOPIC)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--hz", type=float, default=50.0)
@@ -124,11 +199,19 @@ def main() -> int:
     rclpy.init()
     relay = Relay(args.vendor_topic, args.publish_topic)
     threading.Thread(target=rclpy.spin, args=(relay,), daemon=True).start()
-    t0 = time.time()
-    while relay.snapshot_line() is None and time.time() - t0 < 10:
-        time.sleep(0.1)
-    if relay.snapshot_line() is None:
-        print(f"WARN: no data on {args.vendor_topic} yet; still listening", flush=True)
+    # Serve immediately; clients tolerate empty until first sample.
+    threading.Thread(
+        target=lambda: (
+            time.sleep(5.0),
+            print(
+                "WARN: still no joint data after 5s"
+                if relay.snapshot_line() is None
+                else f"joint stream live: {relay.snapshot_line()[:80]}...",
+                flush=True,
+            ),
+        ),
+        daemon=True,
+    ).start()
     try:
         serve(relay, args.host, args.port, args.hz)
     finally:
